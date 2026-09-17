@@ -20,6 +20,23 @@ enum Page {
     Settings,
 }
 
+/// 侧栏会话级搜索摘要
+struct SearchHit {
+    /// 正文/附件命中次数（标题命中可为 0）
+    hit_count: usize,
+    snippet: String,
+}
+
+/// 单次关键词命中（可跳转）
+#[derive(Debug, Clone)]
+struct SearchMatch {
+    conv_id: Uuid,
+    msg_id: Uuid,
+    /// 在 `Message.content` 中的字节起点；附件名命中时为 None
+    byte_start: Option<usize>,
+    byte_len: usize,
+}
+
 pub struct AskwayApp {
     data: AppData,
     page: Page,
@@ -45,6 +62,18 @@ pub struct AskwayApp {
     follow_latest_message: bool,
     /// 上次把流式内容刷新到界面的时间（用于节流，避免每 token 卡 UI）
     last_stream_ui: Instant,
+    /// 侧栏全文搜索关键词
+    sidebar_search: String,
+    /// 已应用到导航的搜索词（用于检测变更）
+    search_query_applied: String,
+    /// 当前会话内的全部关键词命中
+    search_matches: Vec<SearchMatch>,
+    /// 当前命中下标
+    search_match_idx: usize,
+    /// 下一帧滚到当前命中关键词位置
+    scroll_to_match: bool,
+    /// 搜索命中高亮（消息 id + 开始时间）
+    highlight_msg: Option<(Uuid, Instant)>,
 }
 
 impl AskwayApp {
@@ -88,6 +117,12 @@ impl AskwayApp {
             scroll_messages_to_bottom: false,
             follow_latest_message: true,
             last_stream_ui: Instant::now(),
+            sidebar_search: String::new(),
+            search_query_applied: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
+            scroll_to_match: false,
+            highlight_msg: None,
         }
     }
 
@@ -249,6 +284,173 @@ impl AskwayApp {
     fn current_conv_mut(&mut self) -> Option<&mut Conversation> {
         let id = self.data.current_id?;
         self.data.conversations.iter_mut().find(|c| c.id == id)
+    }
+
+    /// 会话是否匹配搜索（标题 / 正文 / 附件名），并给出摘要
+    fn search_conversation(conv: &Conversation, query: &str) -> Option<SearchHit> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Some(SearchHit {
+                hit_count: 0,
+                snippet: String::new(),
+            });
+        }
+
+        let matches = Self::collect_matches(conv, q);
+        if let Some(first) = matches.first() {
+            let snippet = match first.byte_start {
+                Some(start) => {
+                    if let Some(msg) = conv.messages.iter().find(|m| m.id == first.msg_id) {
+                        snippet_around_byte(&msg.content, start, first.byte_len, 48)
+                    } else {
+                        String::new()
+                    }
+                }
+                None => {
+                    if let Some(msg) = conv.messages.iter().find(|m| m.id == first.msg_id) {
+                        let name = msg
+                            .attachments
+                            .iter()
+                            .find(|a| a.name.to_lowercase().contains(&q.to_lowercase()))
+                            .map(|a| a.name.as_str())
+                            .unwrap_or("附件");
+                        format!("附件 · {}", truncate_chars(name, 40))
+                    } else {
+                        String::new()
+                    }
+                }
+            };
+            return Some(SearchHit {
+                hit_count: matches.len(),
+                snippet,
+            });
+        }
+
+        let title = if conv.title.is_empty() {
+            "新对话"
+        } else {
+            conv.title.as_str()
+        };
+        if title.to_lowercase().contains(&q.to_lowercase()) {
+            return Some(SearchHit {
+                hit_count: 0,
+                snippet: format!("标题 · {}", truncate_chars(title, 40)),
+            });
+        }
+        None
+    }
+
+    /// 收集会话内全部可跳转命中（按消息顺序，同消息内按出现顺序）
+    fn collect_matches(conv: &Conversation, query: &str) -> Vec<SearchMatch> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let q_lower = q.to_lowercase();
+        let mut out = Vec::new();
+
+        for msg in &conv.messages {
+            for (byte_start, byte_end) in find_all_match_ranges(&msg.content, &q_lower) {
+                out.push(SearchMatch {
+                    conv_id: conv.id,
+                    msg_id: msg.id,
+                    byte_start: Some(byte_start),
+                    byte_len: byte_end - byte_start,
+                });
+            }
+            for att in &msg.attachments {
+                if att.name.to_lowercase().contains(&q_lower) {
+                    out.push(SearchMatch {
+                        conv_id: conv.id,
+                        msg_id: msg.id,
+                        byte_start: None,
+                        byte_len: 0,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn clear_search_navigation(&mut self) {
+        self.search_query_applied.clear();
+        self.search_matches.clear();
+        self.search_match_idx = 0;
+        self.scroll_to_match = false;
+        self.highlight_msg = None;
+    }
+
+    /// 加载某会话的命中列表；`jump` 为 true 时跳到第 first 处
+    fn load_search_matches(&mut self, conv_id: Uuid, jump: bool) {
+        let q = self.sidebar_search.trim().to_string();
+        self.search_query_applied = q.clone();
+        let matches = self
+            .data
+            .conversations
+            .iter()
+            .find(|c| c.id == conv_id)
+            .map(|c| Self::collect_matches(c, &q))
+            .unwrap_or_default();
+        self.search_matches = matches;
+        self.search_match_idx = 0;
+        if jump && !self.search_matches.is_empty() {
+            self.focus_current_search_match();
+        } else {
+            self.scroll_to_match = false;
+            if let Some(m) = self.search_matches.first() {
+                self.highlight_msg = Some((m.msg_id, Instant::now()));
+            } else {
+                self.highlight_msg = None;
+            }
+        }
+    }
+
+    fn focus_current_search_match(&mut self) {
+        let Some(m) = self.search_matches.get(self.search_match_idx).cloned() else {
+            self.scroll_to_match = false;
+            return;
+        };
+        if self.data.current_id != Some(m.conv_id) {
+            self.data.current_id = Some(m.conv_id);
+            self.sync_settings_from_current_conv();
+            self.dirty = true;
+            self.persist();
+        }
+        self.page = Page::Chat;
+        self.scroll_to_match = true;
+        self.scroll_messages_to_bottom = false;
+        self.follow_latest_message = false;
+        self.highlight_msg = Some((m.msg_id, Instant::now()));
+    }
+
+    fn goto_search_delta(&mut self, delta: isize) {
+        let n = self.search_matches.len();
+        if n == 0 {
+            return;
+        }
+        self.search_match_idx =
+            ((self.search_match_idx as isize + delta).rem_euclid(n as isize)) as usize;
+        self.focus_current_search_match();
+    }
+
+    /// 搜索词变化时，刷新当前会话命中（不自动跳转）
+    fn sync_search_query_if_changed(&mut self) {
+        let q = self.sidebar_search.trim().to_string();
+        if q == self.search_query_applied {
+            return;
+        }
+        if q.is_empty() {
+            self.clear_search_navigation();
+            return;
+        }
+        if let Some(id) = self.data.current_id {
+            self.load_search_matches(id, false);
+        } else {
+            self.search_query_applied = q;
+            self.search_matches.clear();
+            self.search_match_idx = 0;
+            self.scroll_to_match = false;
+        }
     }
 
     /// 将当前会话的厂家/模型同步到全局设置（切换会话或改会话路由后调用）
@@ -707,60 +909,80 @@ impl AskwayApp {
                 ui.set_max_width(sidebar_w - 8.0);
 
                 let mut select_id = None;
+                let mut select_and_jump = false;
                 let mut delete_id = None;
                 let current = self.data.current_id;
+                let query = self.sidebar_search.clone();
+                let searching = !query.trim().is_empty();
 
+                let mut matched_any = false;
                 for conv in &self.data.conversations {
+                    let Some(hit) = Self::search_conversation(conv, &query) else {
+                        continue;
+                    };
+                    matched_any = true;
+
                     let selected = current == Some(conv.id);
                     let title = if conv.title.is_empty() {
                         "新对话"
                     } else {
                         &conv.title
                     };
-                    let meta = format!("{} · {}", conv.provider.label(), conv.model);
+                    let meta = if searching && hit.hit_count > 0 {
+                        format!(
+                            "{} · {} · {} 处",
+                            conv.provider.label(),
+                            conv.model,
+                            hit.hit_count
+                        )
+                    } else {
+                        format!("{} · {}", conv.provider.label(), conv.model)
+                    };
 
+                    let row_id = ui.id().with(("conv_row", conv.id));
+                    let hovered = ui
+                        .ctx()
+                        .read_response(row_id)
+                        .is_some_and(|r| r.hovered());
                     let bg = if selected {
                         Color32::from_rgb(232, 240, 255)
+                    } else if hovered {
+                        Color32::from_rgb(240, 244, 248)
                     } else {
                         Color32::TRANSPARENT
                     };
 
-                    let mut row_clicked = false;
-                    Frame::new()
+                    let mut delete_clicked = false;
+                    let frame_out = Frame::new()
                         .fill(bg)
                         .corner_radius(8.0)
                         .inner_margin(Margin::symmetric(8, 6))
                         .show(ui, |ui| {
-                            ui.set_max_width(ui.available_width());
+                            // 整行占满侧栏宽度，空白区域也可点
+                            let row_w = ui.available_width();
+                            ui.set_width(row_w);
+                            ui.set_max_width(row_w);
+                            ui.set_min_width(row_w);
 
                             ui.horizontal(|ui| {
                                 let del_w = 26.0;
                                 let title_w = (ui.available_width() - del_w).max(40.0);
 
-                                let title_resp = ui
-                                    .allocate_ui_with_layout(
-                                        Vec2::new(title_w, 22.0),
-                                        Layout::left_to_right(Align::Center),
-                                        |ui| {
-                                            ui.set_max_width(title_w);
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(title)
-                                                        .size(14.0)
-                                                        .color(Color32::from_rgb(28, 36, 44)),
-                                                )
-                                                .truncate()
-                                                .sense(Sense::click()),
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(title_w, 22.0),
+                                    Layout::left_to_right(Align::Center),
+                                    |ui| {
+                                        ui.set_max_width(title_w);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(title)
+                                                    .size(14.0)
+                                                    .color(Color32::from_rgb(28, 36, 44)),
                                             )
-                                            .on_hover_cursor(CursorIcon::PointingHand)
-                                        },
-                                    )
-                                    .inner;
-
-                                if title_resp.clicked() {
-                                    row_clicked = true;
-                                }
-                                title_resp.on_hover_text(title);
+                                            .truncate(),
+                                        );
+                                    },
+                                );
 
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if ui
@@ -769,7 +991,7 @@ impl AskwayApp {
                                         .on_hover_text("删除对话")
                                         .clicked()
                                     {
-                                        delete_id = Some(conv.id);
+                                        delete_clicked = true;
                                     }
                                 });
                             });
@@ -782,21 +1004,66 @@ impl AskwayApp {
                                 )
                                 .truncate(),
                             );
+
+                            if searching && !hit.snippet.is_empty() {
+                                ui.add_space(2.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&hit.snippet)
+                                            .size(11.5)
+                                            .color(Color32::from_rgb(70, 100, 140)),
+                                    )
+                                    .truncate(),
+                                );
+                            }
                         });
 
-                    if row_clicked {
+                    let row_resp = ui
+                        .interact(frame_out.response.rect, row_id, Sense::click())
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text(title);
+
+                    if delete_clicked {
+                        delete_id = Some(conv.id);
+                    } else if row_resp.clicked() {
                         select_id = Some(conv.id);
+                        select_and_jump = searching && hit.hit_count > 0;
                     }
                     ui.add_space(4.0);
+                }
+
+                if searching && !matched_any {
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new("未找到匹配的问答")
+                                .size(13.0)
+                                .color(Color32::from_rgb(120, 130, 140)),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("试试其他关键词")
+                                .size(12.0)
+                                .color(Color32::from_rgb(150, 158, 166)),
+                        );
+                    });
                 }
 
                 if let Some(id) = select_id {
                     self.data.current_id = Some(id);
                     self.page = Page::Chat;
-                    // 切换会话时恢复该会话的厂家/模型，保证后续请求走对应 API
                     self.sync_settings_from_current_conv();
-                    self.scroll_messages_to_bottom = true;
-                    self.follow_latest_message = true;
+                    if select_and_jump {
+                        self.load_search_matches(id, true);
+                    } else if searching {
+                        self.load_search_matches(id, false);
+                        self.scroll_messages_to_bottom = true;
+                        self.follow_latest_message = true;
+                    } else {
+                        self.clear_search_navigation();
+                        self.scroll_messages_to_bottom = true;
+                        self.follow_latest_message = true;
+                    }
                     self.dirty = true;
                     self.persist();
                 }
@@ -826,6 +1093,93 @@ impl AskwayApp {
                 )
                 .truncate(),
             );
+        });
+    }
+
+    /// 主窗口顶部：全文搜索框与上一个/下一个
+    fn ui_search_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 4.0);
+
+            let searching = !self.sidebar_search.trim().is_empty();
+            let nav_w = if searching { 220.0 } else { 56.0 };
+            let search_w = (ui.available_width() - nav_w).max(120.0);
+
+            let resp = ui.add_sized(
+                [search_w, 28.0],
+                egui::TextEdit::singleline(&mut self.sidebar_search)
+                    .hint_text(
+                        RichText::new("搜索已有问答…")
+                            .color(Color32::from_rgb(140, 150, 160)),
+                    )
+                    .desired_width(search_w),
+            );
+            if resp.changed() {
+                self.sync_search_query_if_changed();
+            }
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if let Some(id) = self.data.current_id {
+                    self.load_search_matches(id, true);
+                }
+            }
+
+            if searching {
+                if ui
+                    .add(egui::Button::new(RichText::new("清除").size(12.5)))
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.sidebar_search.clear();
+                    self.clear_search_navigation();
+                }
+
+                let total = self.search_matches.len();
+                if total > 0 {
+                    let cur = self.search_match_idx + 1;
+                    ui.label(
+                        RichText::new(format!("{cur}/{total}"))
+                            .size(13.0)
+                            .color(Color32::from_rgb(70, 90, 110)),
+                    );
+
+                    let prev = ui
+                        .add_enabled(
+                            total > 1,
+                            egui::Button::new(RichText::new("上一个").size(12.5)),
+                        )
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text("跳到上一处关键词（Shift+F3）");
+                    if prev.clicked() {
+                        self.goto_search_delta(-1);
+                    }
+
+                    let next = ui
+                        .add(egui::Button::new(RichText::new("下一个").size(12.5)))
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text("跳到下一处关键词（F3）");
+                    if next.clicked() {
+                        self.goto_search_delta(1);
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("无匹配")
+                            .size(12.5)
+                            .color(Color32::from_rgb(150, 110, 90)),
+                    );
+                }
+            }
+
+            if ui.input(|i| i.key_pressed(egui::Key::F3)) {
+                if !self.search_matches.is_empty() {
+                    if ui.input(|i| i.modifiers.shift) {
+                        self.goto_search_delta(-1);
+                    } else {
+                        self.goto_search_delta(1);
+                    }
+                } else if let Some(id) = self.data.current_id {
+                    self.load_search_matches(id, true);
+                }
+            }
         });
     }
 
@@ -862,6 +1216,8 @@ impl AskwayApp {
                 self.sidebar_toggle_icon_button(ui);
             });
         });
+        ui.add_space(6.0);
+        self.ui_search_bar(ui);
         ui.add_space(4.0);
         ui.separator();
         ui.add_space(4.0);
@@ -1208,7 +1564,21 @@ impl AskwayApp {
     fn render_message(&mut self, ui: &mut egui::Ui, msg: &Message) {
         let is_user = msg.role == Role::User;
         let is_assistant = msg.role == Role::Assistant;
-        let (bg, stroke) = if is_user {
+        let active_match = self
+            .search_matches
+            .get(self.search_match_idx)
+            .filter(|m| m.msg_id == msg.id)
+            .cloned();
+        let highlighted = active_match.is_some()
+            || self.highlight_msg.as_ref().is_some_and(|(id, at)| {
+                *id == msg.id && at.elapsed().as_secs() < 4
+            });
+        let (bg, stroke) = if highlighted {
+            (
+                Color32::from_rgb(255, 248, 220),
+                Color32::from_rgb(230, 180, 60),
+            )
+        } else if is_user {
             (
                 Color32::from_rgb(232, 240, 255),
                 Color32::from_rgb(210, 224, 255),
@@ -1236,93 +1606,198 @@ impl AskwayApp {
             .as_ref()
             .is_some_and(|(id, at)| *id == msg.id && at.elapsed().as_secs() < 2);
 
+        let search_q = self.sidebar_search.trim().to_string();
+        let show_search_highlight = !search_q.is_empty()
+            && !content.is_empty()
+            && content != "…"
+            && content.to_lowercase().contains(&search_q.to_lowercase());
+        let active_byte_start = active_match.as_ref().and_then(|m| m.byte_start);
+        let mut did_scroll_keyword = false;
+
         let col_w = ui.available_width();
-        ui.allocate_ui_with_layout(
-            Vec2::new(col_w, 0.0),
-            Layout::top_down(Align::Min).with_cross_justify(true),
-            |ui| {
-                ui.set_max_width(col_w);
-                Frame::new()
-                    .fill(bg)
-                    .corner_radius(16.0)
-                    .inner_margin(Margin::symmetric(14, 12))
-                    .stroke(Stroke::new(1.0, stroke))
-                    .show(ui, |ui| {
-                        let inner_w = ui.available_width();
-                        ui.set_min_width(inner_w);
-                        ui.allocate_space(Vec2::new(inner_w, 0.0));
+        let frame_resp = ui
+            .allocate_ui_with_layout(
+                Vec2::new(col_w, 0.0),
+                Layout::top_down(Align::Min).with_cross_justify(true),
+                |ui| {
+                    ui.set_max_width(col_w);
+                    Frame::new()
+                        .fill(bg)
+                        .corner_radius(16.0)
+                        .inner_margin(Margin::symmetric(14, 12))
+                        .stroke(Stroke::new(if highlighted { 2.0 } else { 1.0 }, stroke))
+                        .show(ui, |ui| {
+                            let inner_w = ui.available_width();
+                            ui.set_min_width(inner_w);
+                            ui.allocate_space(Vec2::new(inner_w, 0.0));
 
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(msg.role.label())
-                                    .strong()
-                                    .size(12.0)
-                                    .color(Color32::from_rgb(90, 110, 130)),
-                            );
-                            ui.label(
-                                RichText::new(msg.created_at.format("%H:%M").to_string())
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(150, 160, 170)),
-                            );
-                            if can_copy {
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let label = if copied_recently { "已复制" } else { "复制" };
-                                    let btn = ui.add(
-                                        egui::Button::new(
-                                            RichText::new(label)
-                                                .size(11.5)
-                                                .color(if copied_recently {
-                                                    Color32::from_rgb(46, 125, 50)
-                                                } else {
-                                                    Color32::from_rgb(90, 110, 130)
-                                                }),
-                                        )
-                                        .frame(false)
-                                        .min_size(Vec2::new(36.0, 18.0)),
-                                    );
-                                    if btn
-                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                        .on_hover_text("复制到剪贴板")
-                                        .clicked()
-                                    {
-                                        ui.ctx().copy_text(msg.content.clone());
-                                        self.copied_msg = Some((msg.id, Instant::now()));
-                                        self.status = "已复制到剪贴板".into();
-                                    }
-                                });
-                            }
-                        });
-                        ui.add_space(4.0);
-
-                        if !msg.attachments.is_empty() {
-                            ui.horizontal_wrapped(|ui| {
-                                for att in &msg.attachments {
-                                    Frame::new()
-                                        .fill(Color32::from_rgb(248, 250, 252))
-                                        .stroke(Stroke::new(
-                                            1.0,
-                                            Color32::from_rgb(220, 226, 232),
-                                        ))
-                                        .corner_radius(8.0)
-                                        .inner_margin(Margin::symmetric(8, 3))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                RichText::new(att.summary())
-                                                    .size(12.0)
-                                                    .color(Color32::from_rgb(50, 80, 95)),
-                                            );
-                                        });
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(msg.role.label())
+                                        .strong()
+                                        .size(12.0)
+                                        .color(Color32::from_rgb(90, 110, 130)),
+                                );
+                                ui.label(
+                                    RichText::new(msg.created_at.format("%H:%M").to_string())
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(150, 160, 170)),
+                                );
+                                if can_copy {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        let label = if copied_recently { "已复制" } else { "复制" };
+                                        let btn = ui.add(
+                                            egui::Button::new(
+                                                RichText::new(label)
+                                                    .size(11.5)
+                                                    .color(if copied_recently {
+                                                        Color32::from_rgb(46, 125, 50)
+                                                    } else {
+                                                        Color32::from_rgb(90, 110, 130)
+                                                    }),
+                                            )
+                                            .frame(false)
+                                            .min_size(Vec2::new(36.0, 18.0)),
+                                        );
+                                        if btn
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .on_hover_text("复制到剪贴板")
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(msg.content.clone());
+                                            self.copied_msg = Some((msg.id, Instant::now()));
+                                            self.status = "已复制到剪贴板".into();
+                                        }
+                                    });
                                 }
                             });
-                            ui.add_space(6.0);
-                        }
+                            ui.add_space(4.0);
 
-                        if !content.is_empty() {
-                            if is_assistant {
-                                // 流式输出中用纯文本，避免每帧重跑 Markdown 卡死 UI；结束后再渲染 MD
+                            if !msg.attachments.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    for att in &msg.attachments {
+                                        let att_hit = active_match
+                                            .as_ref()
+                                            .is_some_and(|m| m.byte_start.is_none())
+                                            && !search_q.is_empty()
+                                            && att
+                                                .name
+                                                .to_lowercase()
+                                                .contains(&search_q.to_lowercase());
+                                        let att_resp = Frame::new()
+                                            .fill(if att_hit {
+                                                Color32::from_rgb(255, 236, 179)
+                                            } else {
+                                                Color32::from_rgb(248, 250, 252)
+                                            })
+                                            .stroke(Stroke::new(
+                                                1.0,
+                                                if att_hit {
+                                                    Color32::from_rgb(230, 180, 60)
+                                                } else {
+                                                    Color32::from_rgb(220, 226, 232)
+                                                },
+                                            ))
+                                            .corner_radius(8.0)
+                                            .inner_margin(Margin::symmetric(8, 3))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new(att.summary())
+                                                        .size(12.0)
+                                                        .color(Color32::from_rgb(50, 80, 95)),
+                                                );
+                                            })
+                                            .response;
+                                        if att_hit && self.scroll_to_match {
+                                            att_resp.scroll_to_me(Some(Align::Center));
+                                            did_scroll_keyword = true;
+                                        }
+                                    }
+                                });
+                                ui.add_space(6.0);
+                            }
+
+                            if !content.is_empty() {
                                 let streaming_this =
                                     self.streaming && self.stream_msg_id == Some(msg.id);
-                                if streaming_this {
+                                if is_assistant {
+                                    // 流式输出中用纯文本，避免每帧重跑 Markdown 卡死 UI；结束后再渲染 MD
+                                    // 搜索时也保持 MD 格式；有精确命中时按块渲染以便滚到含关键词的段落
+                                    if streaming_this {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(content)
+                                                    .size(14.5)
+                                                    .color(Color32::from_rgb(28, 36, 44)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    } else {
+                                        let md_w = ui.available_width();
+                                        let scroll_byte = if self.scroll_to_match {
+                                            active_byte_start
+                                        } else {
+                                            None
+                                        };
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(md_w, 0.0),
+                                            Layout::top_down(Align::Min),
+                                            |ui| {
+                                                ui.set_max_width(md_w);
+                                                if let Some(target) = scroll_byte {
+                                                    if render_markdown_scrolling_to_byte(
+                                                        ui,
+                                                        &mut self.md_cache,
+                                                        content,
+                                                        md_w,
+                                                        target,
+                                                    ) {
+                                                        did_scroll_keyword = true;
+                                                    }
+                                                } else {
+                                                    for seg in crate::md_table::split_markdown_tables(
+                                                        content,
+                                                    ) {
+                                                        match seg {
+                                                            crate::md_table::MdSegment::Markdown(
+                                                                md,
+                                                            ) => {
+                                                                CommonMarkViewer::new()
+                                                                    .default_width(Some(
+                                                                        md_w as usize,
+                                                                    ))
+                                                                    .show(
+                                                                        ui,
+                                                                        &mut self.md_cache,
+                                                                        &md,
+                                                                    );
+                                                            }
+                                                            crate::md_table::MdSegment::Table {
+                                                                headers,
+                                                                rows,
+                                                            } => {
+                                                                crate::md_table::render_markdown_table(
+                                                                    ui, &headers, &rows,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    }
+                                } else if show_search_highlight && !streaming_this {
+                                    // 用户消息为纯文本，可高亮关键词并滚到精确位置
+                                    if render_content_with_search_hits(
+                                        ui,
+                                        content,
+                                        &search_q,
+                                        active_byte_start,
+                                        self.scroll_to_match,
+                                    ) {
+                                        did_scroll_keyword = true;
+                                    }
+                                } else {
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(content)
@@ -1331,49 +1806,20 @@ impl AskwayApp {
                                         )
                                         .wrap(),
                                     );
-                                } else {
-                                    let md_w = ui.available_width();
-                                    ui.allocate_ui_with_layout(
-                                        Vec2::new(md_w, 0.0),
-                                        Layout::top_down(Align::Min),
-                                        |ui| {
-                                            ui.set_max_width(md_w);
-                                            for seg in
-                                                crate::md_table::split_markdown_tables(content)
-                                            {
-                                                match seg {
-                                                    crate::md_table::MdSegment::Markdown(md) => {
-                                                        CommonMarkViewer::new()
-                                                            .default_width(Some(md_w as usize))
-                                                            .show(ui, &mut self.md_cache, &md);
-                                                    }
-                                                    crate::md_table::MdSegment::Table {
-                                                        headers,
-                                                        rows,
-                                                    } => {
-                                                        crate::md_table::render_markdown_table(
-                                                            ui, &headers, &rows,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        },
-                                    );
                                 }
-                            } else {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(content)
-                                            .size(14.5)
-                                            .color(Color32::from_rgb(28, 36, 44)),
-                                    )
-                                    .wrap(),
-                                );
                             }
-                        }
-                    });
-            },
-        );
+                        });
+                },
+            )
+            .response;
+
+        if did_scroll_keyword {
+            self.scroll_to_match = false;
+        } else if self.scroll_to_match && active_match.is_some() {
+            // 附件/无正文命中：滚到整条消息
+            frame_resp.scroll_to_me(Some(Align::Center));
+            self.scroll_to_match = false;
+        }
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
@@ -1845,6 +2291,14 @@ impl eframe::App for AskwayApp {
             }
         }
 
+        if let Some((_, at)) = self.highlight_msg {
+            if at.elapsed().as_secs() < 4 {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            } else {
+                self.highlight_msg = None;
+            }
+        }
+
         if self.data.sidebar_open {
             egui::SidePanel::left("sidebar")
                 .exact_width(240.0)
@@ -1929,6 +2383,255 @@ fn truncate_chars(s: &str, max: usize) -> String {
     } else {
         format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
     }
+}
+
+/// 在原文中按小写查询找出全部命中字节区间（保证落在 char boundary）
+fn find_all_match_ranges(content: &str, query_lower: &str) -> Vec<(usize, usize)> {
+    if query_lower.is_empty() || content.is_empty() {
+        return Vec::new();
+    }
+    let lower = content.to_lowercase();
+    let q_len = query_lower.len();
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start <= lower.len() {
+        let Some(pos) = lower[start..].find(query_lower) else {
+            break;
+        };
+        let byte_start = start + pos;
+        let byte_end = byte_start + q_len;
+        if content.is_char_boundary(byte_start) && content.is_char_boundary(byte_end) {
+            out.push((byte_start, byte_end));
+        }
+        start = byte_end.max(byte_start + 1);
+        if start > lower.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// 按命中字节位置截取上下文摘要
+fn snippet_around_byte(content: &str, byte_start: usize, byte_len: usize, max_chars: usize) -> String {
+    let chars: Vec<(usize, char)> = content.char_indices().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    let match_char_idx = chars
+        .iter()
+        .position(|(i, _)| *i >= byte_start)
+        .unwrap_or(0);
+    let query_chars = content
+        .get(byte_start..byte_start + byte_len)
+        .map(|s| s.chars().count())
+        .unwrap_or(1)
+        .max(1);
+    let half = max_chars.saturating_sub(query_chars) / 2;
+    let start = match_char_idx.saturating_sub(half);
+    let end = (start + max_chars).min(chars.len());
+    let start = end.saturating_sub(max_chars).min(start);
+
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    for (_, ch) in &chars[start..end] {
+        if *ch == '\n' || *ch == '\r' {
+            out.push(' ');
+        } else {
+            out.push(*ch);
+        }
+    }
+    if end < chars.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// 按段落块渲染 Markdown，并滚到包含 `target_byte` 的那一块（保持 MD 格式）
+fn render_markdown_scrolling_to_byte(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    content: &str,
+    md_w: f32,
+    target_byte: usize,
+) -> bool {
+    let blocks = split_md_scroll_blocks(content);
+    let mut scrolled = false;
+
+    for (start, end, block) in blocks {
+        let hit = target_byte >= start && target_byte < end.max(start.saturating_add(1));
+        let resp = ui
+            .allocate_ui_with_layout(
+                Vec2::new(md_w, 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_max_width(md_w);
+                    for seg in crate::md_table::split_markdown_tables(block) {
+                        match seg {
+                            crate::md_table::MdSegment::Markdown(md) => {
+                                CommonMarkViewer::new()
+                                    .default_width(Some(md_w as usize))
+                                    .show(ui, cache, &md);
+                            }
+                            crate::md_table::MdSegment::Table { headers, rows } => {
+                                crate::md_table::render_markdown_table(ui, &headers, &rows);
+                            }
+                        }
+                    }
+                },
+            )
+            .response;
+
+        if hit && !scrolled {
+            resp.scroll_to_me(Some(Align::Center));
+            scrolled = true;
+        }
+        let _ = end;
+    }
+
+    scrolled
+}
+
+/// 按空行拆成可独立渲染的 Markdown 块（代码围栏内不拆），并保留原文字节区间
+fn split_md_scroll_blocks(content: &str) -> Vec<(usize, usize, &str)> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+
+    let mut blocks = Vec::new();
+    let mut block_start = 0usize;
+    let mut line_start = 0usize;
+    let mut in_fence = false;
+
+    for line in content.split_inclusive('\n') {
+        let line_end = line_start + line.len();
+        let trimmed = line.trim_start().trim_end_matches(['\r', '\n']);
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+        }
+
+        let is_blank = trimmed.is_empty();
+        if !in_fence && is_blank && block_start < line_start {
+            let block = &content[block_start..line_start];
+            if !block.trim().is_empty() {
+                blocks.push((block_start, line_start, block));
+            }
+            block_start = line_end;
+        }
+        line_start = line_end;
+    }
+
+    if block_start < content.len() {
+        let block = &content[block_start..];
+        if !block.trim().is_empty() {
+            blocks.push((block_start, content.len(), block));
+        }
+    }
+
+    if blocks.is_empty() {
+        blocks.push((0, content.len(), content));
+    }
+    blocks
+}
+
+/// 渲染带关键词高亮的正文；若滚到当前命中则返回 true
+fn render_content_with_search_hits(
+    ui: &mut egui::Ui,
+    content: &str,
+    query: &str,
+    active_byte_start: Option<usize>,
+    do_scroll: bool,
+) -> bool {
+    let q_lower = query.trim().to_lowercase();
+    let ranges = find_all_match_ranges(content, &q_lower);
+    if ranges.is_empty() {
+        ui.add(
+            egui::Label::new(
+                RichText::new(content)
+                    .size(14.5)
+                    .color(Color32::from_rgb(28, 36, 44)),
+            )
+            .wrap(),
+        );
+        return false;
+    }
+
+    let text_color = Color32::from_rgb(28, 36, 44);
+    let hit_bg = Color32::from_rgb(255, 236, 150);
+    let active_bg = Color32::from_rgb(255, 196, 60);
+    let mut scrolled = false;
+
+    // 按行渲染，保证换行后仍能 scroll_to_me 到关键词控件
+    ui.vertical(|ui| {
+        ui.set_max_width(ui.available_width());
+        let mut line_start = 0usize;
+        while line_start <= content.len() {
+            let line_end = content[line_start..]
+                .find('\n')
+                .map(|i| line_start + i)
+                .unwrap_or(content.len());
+            let line = &content[line_start..line_end];
+
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let mut pos = line_start;
+                let line_ranges: Vec<(usize, usize)> = ranges
+                    .iter()
+                    .copied()
+                    .filter(|(s, e)| *e > line_start && *s < line_end)
+                    .map(|(s, e)| (s.max(line_start), e.min(line_end)))
+                    .collect();
+
+                if line_ranges.is_empty() {
+                    if !line.is_empty() {
+                        ui.label(RichText::new(line).size(14.5).color(text_color));
+                    } else {
+                        ui.label(RichText::new(" ").size(14.5));
+                    }
+                } else {
+                    for (s, e) in line_ranges {
+                        if pos < s {
+                            ui.label(
+                                RichText::new(&content[pos..s])
+                                    .size(14.5)
+                                    .color(text_color),
+                            );
+                        }
+                        // 以原始命中起点为准（未裁到行首的伪起点）
+                        let is_active = active_byte_start == Some(s);
+                        let bg = if is_active { active_bg } else { hit_bg };
+                        let resp = ui.label(
+                            RichText::new(&content[s..e])
+                                .size(14.5)
+                                .color(text_color)
+                                .strong()
+                                .background_color(bg),
+                        );
+                        if is_active && do_scroll && !scrolled {
+                            resp.scroll_to_me(Some(Align::Center));
+                            scrolled = true;
+                        }
+                        pos = e;
+                    }
+                    if pos < line_end {
+                        ui.label(
+                            RichText::new(&content[pos..line_end])
+                                .size(14.5)
+                                .color(text_color),
+                        );
+                    }
+                }
+            });
+
+            if line_end >= content.len() {
+                break;
+            }
+            line_start = line_end + 1;
+        }
+    });
+
+    scrolled
 }
 
 fn labeled_row(
