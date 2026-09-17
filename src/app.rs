@@ -1007,13 +1007,14 @@ impl AskwayApp {
 
                             if searching && !hit.snippet.is_empty() {
                                 ui.add_space(2.0);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&hit.snippet)
-                                            .size(11.5)
-                                            .color(Color32::from_rgb(70, 100, 140)),
-                                    )
-                                    .truncate(),
+                                render_inline_search_hits(
+                                    ui,
+                                    &hit.snippet,
+                                    &query,
+                                    11.5,
+                                    Color32::from_rgb(70, 100, 140),
+                                    false,
+                                    false,
                                 );
                             }
                         });
@@ -1569,16 +1570,7 @@ impl AskwayApp {
             .get(self.search_match_idx)
             .filter(|m| m.msg_id == msg.id)
             .cloned();
-        let highlighted = active_match.is_some()
-            || self.highlight_msg.as_ref().is_some_and(|(id, at)| {
-                *id == msg.id && at.elapsed().as_secs() < 4
-            });
-        let (bg, stroke) = if highlighted {
-            (
-                Color32::from_rgb(255, 248, 220),
-                Color32::from_rgb(230, 180, 60),
-            )
-        } else if is_user {
+        let (bg, stroke) = if is_user {
             (
                 Color32::from_rgb(232, 240, 255),
                 Color32::from_rgb(210, 224, 255),
@@ -1625,7 +1617,7 @@ impl AskwayApp {
                         .fill(bg)
                         .corner_radius(16.0)
                         .inner_margin(Margin::symmetric(14, 12))
-                        .stroke(Stroke::new(if highlighted { 2.0 } else { 1.0 }, stroke))
+                        .stroke(Stroke::new(1.0, stroke))
                         .show(ui, |ui| {
                             let inner_w = ui.available_width();
                             ui.set_min_width(inner_w);
@@ -1676,39 +1668,47 @@ impl AskwayApp {
                             if !msg.attachments.is_empty() {
                                 ui.horizontal_wrapped(|ui| {
                                     for att in &msg.attachments {
-                                        let att_hit = active_match
-                                            .as_ref()
-                                            .is_some_and(|m| m.byte_start.is_none())
-                                            && !search_q.is_empty()
+                                        let summary = att.summary();
+                                        let att_q_hit = !search_q.is_empty()
                                             && att
                                                 .name
                                                 .to_lowercase()
                                                 .contains(&search_q.to_lowercase());
+                                        let att_active = att_q_hit
+                                            && active_match
+                                                .as_ref()
+                                                .is_some_and(|m| m.byte_start.is_none());
                                         let att_resp = Frame::new()
-                                            .fill(if att_hit {
-                                                Color32::from_rgb(255, 236, 179)
-                                            } else {
-                                                Color32::from_rgb(248, 250, 252)
-                                            })
+                                            .fill(Color32::from_rgb(248, 250, 252))
                                             .stroke(Stroke::new(
                                                 1.0,
-                                                if att_hit {
-                                                    Color32::from_rgb(230, 180, 60)
-                                                } else {
-                                                    Color32::from_rgb(220, 226, 232)
-                                                },
+                                                Color32::from_rgb(220, 226, 232),
                                             ))
                                             .corner_radius(8.0)
                                             .inner_margin(Margin::symmetric(8, 3))
                                             .show(ui, |ui| {
-                                                ui.label(
-                                                    RichText::new(att.summary())
-                                                        .size(12.0)
-                                                        .color(Color32::from_rgb(50, 80, 95)),
-                                                );
+                                                if att_q_hit {
+                                                    if render_inline_search_hits(
+                                                        ui,
+                                                        &summary,
+                                                        &search_q,
+                                                        12.0,
+                                                        Color32::from_rgb(50, 80, 95),
+                                                        att_active,
+                                                        self.scroll_to_match,
+                                                    ) {
+                                                        did_scroll_keyword = true;
+                                                    }
+                                                } else {
+                                                    ui.label(
+                                                        RichText::new(&summary)
+                                                            .size(12.0)
+                                                            .color(Color32::from_rgb(50, 80, 95)),
+                                                    );
+                                                }
                                             })
                                             .response;
-                                        if att_hit && self.scroll_to_match {
+                                        if att_active && self.scroll_to_match && !did_scroll_keyword {
                                             att_resp.scroll_to_me(Some(Align::Center));
                                             did_scroll_keyword = true;
                                         }
@@ -1722,7 +1722,6 @@ impl AskwayApp {
                                     self.streaming && self.stream_msg_id == Some(msg.id);
                                 if is_assistant {
                                     // 流式输出中用纯文本，避免每帧重跑 Markdown 卡死 UI；结束后再渲染 MD
-                                    // 搜索时也保持 MD 格式；有精确命中时按块渲染以便滚到含关键词的段落
                                     if streaming_this {
                                         ui.add(
                                             egui::Label::new(
@@ -1734,23 +1733,20 @@ impl AskwayApp {
                                         );
                                     } else {
                                         let md_w = ui.available_width();
-                                        let scroll_byte = if self.scroll_to_match {
-                                            active_byte_start
-                                        } else {
-                                            None
-                                        };
                                         ui.allocate_ui_with_layout(
                                             Vec2::new(md_w, 0.0),
                                             Layout::top_down(Align::Min),
                                             |ui| {
                                                 ui.set_max_width(md_w);
-                                                if let Some(target) = scroll_byte {
-                                                    if render_markdown_scrolling_to_byte(
+                                                if show_search_highlight {
+                                                    if render_markdown_with_search_hits(
                                                         ui,
                                                         &mut self.md_cache,
                                                         content,
                                                         md_w,
-                                                        target,
+                                                        &search_q,
+                                                        active_byte_start,
+                                                        self.scroll_to_match,
                                                     ) {
                                                         did_scroll_keyword = true;
                                                     }
@@ -2448,21 +2444,37 @@ fn snippet_around_byte(content: &str, byte_start: usize, byte_len: usize, max_ch
     out
 }
 
-/// 按段落块渲染 Markdown，并滚到包含 `target_byte` 的那一块（保持 MD 格式）
-fn render_markdown_scrolling_to_byte(
+/// 按段落渲染 Markdown；含关键词的块改为纯文本高亮关键词（不整块涂色）
+fn render_markdown_with_search_hits(
     ui: &mut egui::Ui,
     cache: &mut CommonMarkCache,
     content: &str,
     md_w: f32,
-    target_byte: usize,
+    query: &str,
+    active_byte_start: Option<usize>,
+    do_scroll: bool,
 ) -> bool {
+    let q_lower = query.trim().to_lowercase();
     let blocks = split_md_scroll_blocks(content);
     let mut scrolled = false;
 
     for (start, end, block) in blocks {
-        let hit = target_byte >= start && target_byte < end.max(start.saturating_add(1));
-        let resp = ui
-            .allocate_ui_with_layout(
+        let has_hit = !find_all_match_ranges(block, &q_lower).is_empty();
+        if has_hit {
+            let active = active_byte_start.filter(|abs| {
+                *abs >= start && *abs < end.max(start.saturating_add(1))
+            }).map(|abs| abs - start);
+            if render_content_with_search_hits(
+                ui,
+                block,
+                query,
+                active,
+                do_scroll && !scrolled,
+            ) {
+                scrolled = true;
+            }
+        } else {
+            ui.allocate_ui_with_layout(
                 Vec2::new(md_w, 0.0),
                 Layout::top_down(Align::Min),
                 |ui| {
@@ -2480,12 +2492,7 @@ fn render_markdown_scrolling_to_byte(
                         }
                     }
                 },
-            )
-            .response;
-
-        if hit && !scrolled {
-            resp.scroll_to_me(Some(Align::Center));
-            scrolled = true;
+            );
         }
         let _ = end;
     }
@@ -2533,6 +2540,53 @@ fn split_md_scroll_blocks(content: &str) -> Vec<(usize, usize, &str)> {
         blocks.push((0, content.len(), content));
     }
     blocks
+}
+
+/// 单行文本中高亮关键词（附件名等）
+fn render_inline_search_hits(
+    ui: &mut egui::Ui,
+    text: &str,
+    query: &str,
+    size: f32,
+    color: Color32,
+    is_active_widget: bool,
+    do_scroll: bool,
+) -> bool {
+    let q_lower = query.trim().to_lowercase();
+    let ranges = find_all_match_ranges(text, &q_lower);
+    if ranges.is_empty() {
+        ui.label(RichText::new(text).size(size).color(color));
+        return false;
+    }
+
+    let hit_bg = Color32::from_rgb(255, 236, 150);
+    let active_bg = Color32::from_rgb(255, 196, 60);
+    let mut scrolled = false;
+    let mut pos = 0usize;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        for (s, e) in ranges {
+            if pos < s {
+                ui.label(RichText::new(&text[pos..s]).size(size).color(color));
+            }
+            let resp = ui.label(
+                RichText::new(&text[s..e])
+                    .size(size)
+                    .color(color)
+                    .strong()
+                    .background_color(if is_active_widget { active_bg } else { hit_bg }),
+            );
+            if is_active_widget && do_scroll && !scrolled {
+                resp.scroll_to_me(Some(Align::Center));
+                scrolled = true;
+            }
+            pos = e;
+        }
+        if pos < text.len() {
+            ui.label(RichText::new(&text[pos..]).size(size).color(color));
+        }
+    });
+    scrolled
 }
 
 /// 渲染带关键词高亮的正文；若滚到当前命中则返回 true
