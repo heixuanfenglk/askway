@@ -1,0 +1,29 @@
+[package]
+name = "askway"
+version = "0.1.0"
+edition = "2021"
+description = "Askway — 简洁易用的多提供商 AI 对话桌面客户端"
+authors = ["askway"]
+
+[dependencies]
+eframe = { version = "0.31", default-features = true, features = ["persistence"] }
+egui = "0.31"
+egui_commonmark = { version = "0.20", default-features = false, features = ["pulldown_cmark", "better_syntax_highlighting"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls", "socks"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+rfd = "0.15"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
