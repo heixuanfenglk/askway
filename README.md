@@ -2,6 +2,8 @@
 
 纯 Rust 桌面 AI 对话客户端（eframe / egui），无 Web 前端。
 
+![Askway 界面预览](img.png)
+
 ## 功能
 
 - 多提供商：OpenAI、Anthropic、Gemini、xAI、Mistral、Groq、OpenRouter、DeepSeek、通义、智谱、豆包、硅基流动等 27 家
